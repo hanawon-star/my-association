@@ -5,7 +5,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import streamlit as st
 
-# 페이지 기본 설정
+# 1. App Title & Browser Tab Config
 st.set_page_config(
     page_title="영화 유형 나누기", page_icon="🎬", layout="wide"
 )
@@ -16,7 +16,7 @@ st.write(
 )
 
 
-# 데이터 로드 및 전처리 함수
+# 2. Data Loading & Preprocessing
 @st.cache_data
 def load_and_preprocess_data():
     url = "https://raw.githubusercontent.com/it-teacher-go/data-share-/main/kobis_movies.csv"
@@ -24,7 +24,7 @@ def load_and_preprocess_data():
 
     total_count = len(df)
 
-    # 필요한 데이터 수치형 변환 및 결측치/0값 처리
+    # Convert numeric columns safely
     cols_to_num = [
         "first_scrn",
         "first_week_audi",
@@ -34,112 +34,92 @@ def load_and_preprocess_data():
     for col in cols_to_num:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 값이 없거나 first_week_audi가 0인 데이터 제거
+    # Drop missing values and invalid first_week_audi / positive values for log
     df_clean = df.dropna(subset=cols_to_num).copy()
-    df_clean = df_clean[df_clean["first_week_audi"] > 0].copy()
+    df_clean = df_clean[
+        (df_clean["first_week_audi"] > 0)
+        & (df_clean["first_scrn"] > 0)
+        & (df_clean["total_audi"] > 0)
+    ].copy()
 
-    # 속성 생성 및 변환
-    # 1. 스크린 수 (상용로그)
-    df_clean["log_first_scrn"] = np.log10(
-        df_clean["first_scrn"].replace(0, np.nan)
+    # Derived features & feature transformations
+    df_clean["log_first_scrn"] = np.log10(df_clean["first_scrn"])
+    df_clean["log_total_audi"] = np.log10(df_clean["total_audi"])
+    df_clean["long_run_idx"] = np.minimum(
+        df_clean["total_audi"] / df_clean["first_week_audi"], 20
     )
-    # 2. 누적 관객 (상용로그)
-    df_clean["log_total_audi"] = np.log10(
-        df_clean["total_audi"].replace(0, np.nan)
-    )
-    # 3. 롱런 지수 (누적 관객 / 첫 주 관객, 최대 20으로 클리핑)
-    df_clean["long_run_index"] = (
-        df_clean["total_audi"] / df_clean["first_week_audi"]
-    )
-    df_clean["long_run_index"] = df_clean["long_run_index"].clip(upper=20)
-
-    # 4. 10위권 일수 (days_in_top10는 그대로 사용)
-
-    # 생성된 로그 속성 결측치 추가 제거 (안전 조치)
-    df_clean = df_clean.dropna(
-        subset=[
-            "log_first_scrn",
-            "log_total_audi",
-            "long_run_index",
-            "days_in_top10",
-        ]
-    )
+    # days_in_top10 is used as-is
 
     filtered_count = len(df_clean)
 
     return df_clean, total_count, filtered_count
 
 
-# 데이터 로드
 df, total_count, filtered_count = load_and_preprocess_data()
 
-# 편수 표시
+# Display total and filtered movie count in one line
 st.info(
-    f"📊 **전체 영화 수:** {total_count:,}편 | **분석에 사용된 묶은 영화 수:** {filtered_count:,}편"
+    f"📊 **전체 영화:** {total_count:,}편 | **분석 대상 영화:** {filtered_count:,}편"
 )
 
-# 속성 매핑 설정
+# Feature mapping dictionary
 feature_dict = {
     "스크린 수(로그)": "log_first_scrn",
     "누적 관객(로그)": "log_total_audi",
     "10위권 일수": "days_in_top10",
-    "롱런 지수": "long_run_index",
+    "롱런 지수": "long_run_idx",
 }
 
-# 1. 군집화 속성 선택
-st.subheader("1. 군집화에 사용할 속성 선택")
+# 3. Feature Selection & Clustering
+st.subheader("1. 군집화 속성 선택")
 selected_feature_labels = st.multiselect(
-    "군집화에 사용할 속성을 2개 이상 선택하세요 (기본값: 전체 선택):",
+    "군집화에 사용할 속성을 선택하세요 (최소 2개 이상 선택, 기본값: 전체 선택):",
     options=list(feature_dict.keys()),
     default=list(feature_dict.keys()),
 )
 
 if len(selected_feature_labels) < 2:
-    st.warning("⚠️ 최소 2개 이상의 속성을 선택해야 합니다.")
+    st.warning("⚠️ 최소 2개 이상의 속성을 선택해야 군집화를 수행할 수 있습니다.")
     st.stop()
 
 selected_features = [feature_dict[label] for label in selected_feature_labels]
 
-# 2. 군집화 수행
+# Feature Standardization & KMeans
 X = df[selected_features]
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# K-Means (k=3, random_state 고정)
 kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
 cluster_labels = kmeans.fit_predict(X_scaled)
 df["raw_cluster"] = cluster_labels
 
-# 누적 관객(total_audi) 평균에 따른 묶음 라벨링 (㉮, ㉯, ㉰)
+# Cluster label renaming rule based on mean total_audi (descending: ㉮, ㉯, ㉰)
 cluster_audi_mean = (
     df.groupby("raw_cluster")["total_audi"].mean().sort_values(ascending=False)
 )
-rank_to_symbol = {0: "㉮", 1: "㉯", 2: "㉰"}
-cluster_mapping = {
-    old_cluster: rank_to_symbol[rank]
-    for rank, old_cluster in enumerate(cluster_audi_mean.index)
+symbol_mapping = {
+    old_cluster: symbol
+    for old_cluster, symbol in zip(cluster_audi_mean.index, ["㉮", "㉯", "㉰"])
 }
+df["cluster"] = df["raw_cluster"].map(symbol_mapping)
 
-df["cluster"] = df["raw_cluster"].map(cluster_mapping)
-
-# 시각화용 색상 지도 설정
 color_discrete_map = {"㉮": "#EF553B", "㉯": "#00CC96", "㉰": "#636EFA"}
 
 st.markdown("---")
 
-# 3. 2차원 산점도
+# 4. Visualizations
 st.subheader("2. 2차원 산점도")
-col1, col2 = st.subplots(2)
+col1, col2 = st.columns(2)
 with col1:
     x_2d_label = st.selectbox(
-        "2D 가로축(X축) 속성",
+        "2D X축 속성",
         options=selected_feature_labels,
         index=0,
         key="2d_x",
     )
 with col2:
     y_2d_label = st.selectbox(
-        "2D 세로축(Y축) 속성",
+        "2D Y축 속성",
         options=selected_feature_labels,
         index=min(1, len(selected_feature_labels) - 1),
         key="2d_y",
@@ -165,11 +145,10 @@ st.plotly_chart(fig_2d, use_container_width=True)
 
 st.markdown("---")
 
-# 4. 3차원 산점도
 st.subheader("3. 3차원 산점도")
 if len(selected_feature_labels) < 3:
     st.info(
-        "💡 3차원 산점도를 그리려면 위에서 속성을 3개 이상 선택해 주세요."
+        "💡 3차원 산점도를 그리려면 위 군집화 속성 선택에서 속성을 3개 이상 선택해 주세요."
     )
 else:
     col_x, col_y, col_z = st.columns(3)
@@ -217,7 +196,7 @@ else:
 
 st.markdown("---")
 
-# 5. 묶음별 요약 통계량 (원래 단위 기준)
+# 5. Cluster Analysis & Summary Tables
 st.subheader("4. 묶음별 편수 및 속성 평균 (원래 단위)")
 
 summary_df = (
@@ -227,12 +206,11 @@ summary_df = (
         스크린수_평균=("first_scrn", "mean"),
         누적관객_평균=("total_audi", "mean"),
         _10위권일수_평균=("days_in_top10", "mean"),
-        롱런지수_평균=("long_run_index", "mean"),
+        롱런지수_평균=("long_run_idx", "mean"),
     )
     .reindex(["㉮", "㉯", "㉰"])
 )
 
-# 표 포맷팅
 formatted_summary = summary_df.copy()
 formatted_summary["편수"] = formatted_summary["편수"].apply(
     lambda x: f"{x:,}편"
@@ -262,7 +240,6 @@ st.dataframe(formatted_summary, use_container_width=True)
 
 st.markdown("---")
 
-# 6. 묶음별 누적 관객 수 TOP 5 영화
 st.subheader("5. 묶음별 누적 관객 수 TOP 5 영화")
 
 cols = st.columns(3)
